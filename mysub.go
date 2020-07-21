@@ -26,8 +26,9 @@ func printMsg(m *nats.Msg, i int, count int64) {
 }
 
 const (
-	DefaultNumSubs = 1
-	DefaultNumSubjects = 10
+	DefaultNumSubs      = 1
+	DefaultNumSubjects  = 10
+	DefaultStartSubjNum = 0
 )
 
 func main() {
@@ -35,6 +36,7 @@ func main() {
 	var showTime = flag.Bool("t", false, "Display timestamps")
 	var numSubs = flag.Int("n", DefaultNumSubs, "Number of subscribers")
 	var numSubjects = flag.Int("ns", DefaultNumSubjects, "Number of subject subscribed simultaneously by each subscriber")
+	var startSub = flag.Int("ss", DefaultStartSubjNum, "start subject number")
 	var showHelp = flag.Bool("h", false, "Show help message")
 
 	log.SetFlags(0)
@@ -64,7 +66,7 @@ func main() {
 		}
 		defer nc.Close()
 
-		go runSubscriber(nc, &finishwg, i, *numSubjects, &received)
+		go runSubscriber(nc, &finishwg, i, *numSubjects, *startSub, &received)
 	}
 	finishwg.Wait()
 
@@ -73,10 +75,10 @@ func main() {
 		os.Stdin.Read(make([]byte, 1))
 		end <- struct{}{}
 	}()
-	subj := "subject0"
+	subj := fmt.Sprintf("subject%d", *startSub)
 	totalSubjNum := *numSubs * *numSubjects
 	if totalSubjNum > 1 {
-		subj = fmt.Sprintf("subject0 - subject%d", totalSubjNum-1)
+		subj = fmt.Sprintf("%s - subject%d", subj, totalSubjNum + *startSub - 1)
 	}
 	log.Printf("%d subjects finished, subject: %s (Press enter to end)", totalSubjNum, subj)
 
@@ -113,9 +115,10 @@ func (r *Received) get() (int64, int) {
 	return received, msgSize
 }
 
-func runSubscriber(nc *nats.Conn, finishwg *sync.WaitGroup, num, numSubjects int, received *Received) {
+func runSubscriber(nc *nats.Conn, finishwg *sync.WaitGroup,
+	num, numSubjects, startSub int, received *Received) {
 	for i := 0; i < numSubjects; i++ {
-		subj := "subject" + strconv.Itoa(num * numSubjects + i)
+		subj := "subject" + strconv.Itoa(num * numSubjects + i + startSub)
 		sub, err := nc.Subscribe(subj, func(msg *nats.Msg) {
 			received.add(1, msg)
 			msg.Respond([]byte(""))
