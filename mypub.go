@@ -85,11 +85,12 @@ func main() {
 		for range time.Tick(1 * time.Second) {
 			pubNum := atomic.LoadInt64(&stat.PubNum)
 			timeoutMsgs := atomic.LoadInt64(&stat.TimeoutNum)
-			log.Printf("Total: %d, Published: %d, Speed: %d msgs/s %.2f MB/s, " +
-				"Start: %d, Closed: %d, Timeout Msgs: Total: %d, %d msgs/s",
+			log.Printf("Start: %d, Closed: %d, Total: %d, Published: %d, " +
+				"Speed: %d msgs/s %.2f MB/s, Timeout Msgs: Total: %d, %d msgs/s",
+				atomic.LoadInt64(&count), atomic.LoadInt64(&stat.CloseNum),
 				totalMsgNum, pubNum, pubNum-lastPubNum,
-				float64(pubNum-lastPubNum)*float64(*msgSize)/1024/1024, atomic.LoadInt64(&count),
-				atomic.LoadInt64(&stat.CloseNum), timeoutMsgs, timeoutMsgs-lastTimeout)
+				float64(pubNum-lastPubNum)*float64(*msgSize)/1024/1024,
+				timeoutMsgs, timeoutMsgs-lastTimeout)
 			lastPubNum = pubNum
 			lastTimeout = timeoutMsgs
 		}
@@ -113,17 +114,16 @@ func main() {
 		defer nc.Close()
 
 		for j := 0; j < *numSubjects; j++ {
+			// 超过10W个主题，则每10个主题共用一个协程
 			if totalSubjNum > DefaultSplitNum {
-				// 超过10W个主题，则每10个主题共用一个协程
 				if atomic.LoadInt64(&count)%10 == 0 {
+					numReqs := tmpSubjNum
 					if tmpSubjNum-10 >= 0 {
-						go runPublisher(nc, &sp, 10, *numMsgs, *msgSize,
-							*interval, i**numSubjects+j+*startSub, &stat)
+						numReqs = 10
 						tmpSubjNum -= 10
-					}else{
-						go runPublisher(nc, &sp, tmpSubjNum, *numMsgs, *msgSize,
-							*interval, i**numSubjects+j+*startSub, &stat)
 					}
+					go runPublisher(nc, &sp, numReqs, *numMsgs, *msgSize,
+						*interval, i**numSubjects+j+*startSub, &stat)
 				}
 			}else{
 				go runPublisher(nc, &sp, 1, *numMsgs, *msgSize,
