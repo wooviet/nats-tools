@@ -85,14 +85,14 @@ func main() {
 			log.Fatalf("Can't connect: %v, already connected: %d\n", err, i)
 		}
 		defer nc.Close()
-		atomic.AddInt64(&count, 1)
 
 		go runSubscriber(nc, &finishwg, i, *numSubjects, *startSub, &stat)
+		atomic.AddInt64(&count, 1)
 	}
 	finishwg.Wait()
-	log.Printf("%d subjects finished, subject: %s (Press enter to end)", totalSubjNum, subj)
-
+	log.Printf("%d goroutine finished, subject: %s (Press enter to end)", *numSubs, subj)
 	os.Stdin.Read(make([]byte, 1))
+	log.Printf("Tatol received: %d", atomic.LoadInt64(&stat.Received))
 }
 
 type ReceivedStat struct {
