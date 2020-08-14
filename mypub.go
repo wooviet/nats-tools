@@ -31,6 +31,7 @@ const (
 	DefaultMessageSize  = 128
 	DefaultMsgInterval  = 0
 	DefaultSplitNum     = 100000
+	DefaultSplitGoNum   = 10
 )
 
 func main() {
@@ -38,11 +39,12 @@ func main() {
 		"The nats server URLs (separated by comma)")
 	var numPubs = flag.Int("np", DefaultNumPubs, "Number of publishers")
 	var numSubjects = flag.Int("ns", DefaultNumSubjects,
-		"Number of subject published simultaneously by each publisher")
+		"Number of subject published by each publisher")
+	var splitNum = flag.Int("sn", DefaultSplitGoNum, "Split number")
 	var startSub = flag.Int("ss", DefaultStartSubjNum, "Start subject number")
 	var numMsgs = flag.Int("nm", DefaultNumMsgs, "Number of Messages to Publish")
-	var msgSize = flag.Int("ms", DefaultMessageSize, "Size of the message.")
-	var interval = flag.Int("t", DefaultMsgInterval, "Message interval (ms)")
+	var msgSize = flag.Int("ms", DefaultMessageSize, "Size of the message")
+	var interval = flag.Int("t", DefaultMsgInterval, "Send message interval (ms)")
 	var showHelp = flag.Bool("h", false, "Show help message")
 
 	log.SetFlags(0)
@@ -66,40 +68,49 @@ func main() {
 		log.Fatal("Number of messages interval should be greater than or equal to zero.")
 	}
 
+	if *splitNum <= 0 {
+		log.Fatal("Split number should be greater than zero.")
+	}
+
 	// Connect Options.
+	// opts := []nats.Option{nats.Name("NATS Sample Publisher"), nats.UseOldRequestStyle()}
 	opts := []nats.Option{nats.Name("NATS Sample Publisher")}
 
+	// First topic name
 	subj := fmt.Sprintf("subject%d", *startSub)
 	totalSubjNum := *numPubs * *numSubjects
 	if totalSubjNum > 1 {
+		// All topic names
 		subj = fmt.Sprintf("%s - subject%d", subj, totalSubjNum+*startSub-1)
 	}
 	log.Printf("Starting publish [pubs=%d, subjs=%d, msgs=%d, msgsize=%d], subject: %s\n",
 		*numPubs, totalSubjNum, *numMsgs, *msgSize, subj)
 
-	count := int64(0)
+	goroutineNum := int64(0)
 	stat := PublishStat{}
 	totalMsgNum := *numMsgs * totalSubjNum
+	// goroutine for printing statistics
 	go func() {
-		lastPubNum, lastTimeout := int64(0), int64(0)
-		for range time.Tick(1 * time.Second) {
+		lastPubNum, lastTimeoutMsgs := int64(0), int64(0)
+		for range time.Tick(time.Second) {
 			pubNum := atomic.LoadInt64(&stat.PubNum)
 			timeoutMsgs := atomic.LoadInt64(&stat.TimeoutNum)
-			log.Printf("Start: %d, Closed: %d, Total: %d, Published: %d, " +
+			log.Printf("goroutineNum: %d, Closed: %d, Total: %d, Published msgs: %d, " +
 				"Speed: %d msgs/s %.2f MB/s, Timeout Msgs: Total: %d, %d msgs/s",
-				atomic.LoadInt64(&count), atomic.LoadInt64(&stat.CloseNum),
+				atomic.LoadInt64(&goroutineNum), atomic.LoadInt64(&stat.CloseNum),
 				totalMsgNum, pubNum, pubNum-lastPubNum,
 				float64(pubNum-lastPubNum)*float64(*msgSize)/1024/1024,
-				timeoutMsgs, timeoutMsgs-lastTimeout)
+				timeoutMsgs, timeoutMsgs-lastTimeoutMsgs)
 			lastPubNum = pubNum
-			lastTimeout = timeoutMsgs
+			lastTimeoutMsgs = timeoutMsgs
 		}
 	}()
 
+	// If there are more than DefaultSplitNum topics, each DefaultSplitGoNum topic shares a goroutine
 	finishNum := totalSubjNum
 	if totalSubjNum > DefaultSplitNum {
-		finishNum = totalSubjNum / 10
-		if totalSubjNum%10 != 0 {
+		finishNum = totalSubjNum / *splitNum
+		if totalSubjNum % *splitNum != 0 {
 			finishNum++
 		}
 	}
@@ -114,22 +125,22 @@ func main() {
 		defer nc.Close()
 
 		for j := 0; j < *numSubjects; j++ {
-			// 超过10W个主题，则每10个主题共用一个协程
+			// If there are more than DefaultSplitNum topics, each DefaultSplitGoNum topic shares a goroutine
 			if totalSubjNum > DefaultSplitNum {
-				if atomic.LoadInt64(&count)%10 == 0 {
+				if atomic.LoadInt64(&goroutineNum) % int64(*splitNum) == 0 {
 					numReqs := tmpSubjNum
-					if tmpSubjNum-10 >= 0 {
-						numReqs = 10
-						tmpSubjNum -= 10
+					if tmpSubjNum - *splitNum >= 0 {
+						numReqs = *splitNum
+						tmpSubjNum -= *splitNum
 					}
 					go runPublisher(nc, &sp, numReqs, *numMsgs, *msgSize,
-						*interval, i**numSubjects+j+*startSub, &stat)
+						*interval, i * *numSubjects + j + *startSub, &stat)
 				}
 			}else{
 				go runPublisher(nc, &sp, 1, *numMsgs, *msgSize,
-					*interval, i**numSubjects+j+*startSub, &stat)
+					*interval, i * *numSubjects + j + *startSub, &stat)
 			}
-			atomic.AddInt64(&count, 1)
+			atomic.AddInt64(&goroutineNum, 1)
 		}
 	}
 	log.Printf("%d goroutine finished (Press enter to end)", finishNum)
@@ -160,6 +171,7 @@ func (sp *StopProcess) newSp(wgNum int) *StopProcess {
 
 func runPublisher(nc *nats.Conn, sp *StopProcess,
 	numReqs, numMsgs, msgSize, interval, num int, stat *PublishStat) {
+	// Message content
 	args := flag.Args()[0]
 	msg := []byte(args)
 	if msgSize > 0 {
@@ -185,12 +197,6 @@ func runPublisher(nc *nats.Conn, sp *StopProcess,
 					atomic.AddInt64(&stat.TimeoutNum, 1)
 				}
 			}
-			/*err := nc.Publish(subj, msg)
-			if err != nil {
-				log.Printf("publish failed, errmsg: %v\n", err)
-				continue
-			}
-			nc.Flush()*/
 			atomic.AddInt64(&stat.PubNum, 1)
 			time.Sleep(time.Duration(interval) * time.Millisecond)
 		}

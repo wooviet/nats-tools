@@ -39,7 +39,7 @@ func main() {
 	var showTime = flag.Bool("t", false, "Display timestamps")
 	var numSubs = flag.Int("n", DefaultNumSubs, "Number of subscribers")
 	var numSubjects = flag.Int("ns", DefaultNumSubjects,
-		"Number of subject subscribed simultaneously by each subscriber")
+		"Number of subject subscribed by each subscriber")
 	var startSub = flag.Int("ss", DefaultStartSubjNum, "Start subject number")
 	var showHelp = flag.Bool("h", false, "Show help message")
 
@@ -59,21 +59,25 @@ func main() {
 	opts := []nats.Option{nats.Name("NATS Sample Subscriber")}
 	opts = setupConnOptions(opts)
 
-	count := int64(0)
-	stat := ReceivedStat{}
+	// First topic name
 	subj := fmt.Sprintf("subject%d", *startSub)
 	totalSubjNum := *numSubs * *numSubjects
 	if totalSubjNum > 1 {
+		// All topic names
 		subj = fmt.Sprintf("%s - subject%d", subj, totalSubjNum + *startSub - 1)
 	}
+
+	// goroutine for printing statistics
+	goroutineNum := int64(0)
+	stat := ReceivedStat{}
 	go func() {
-		lastSubNum := int64(0)
+		lastReceived := int64(0)
 		for range time.Tick(1 * time.Second){
-			subNum, size := atomic.LoadInt64(&stat.Received), atomic.LoadInt64(&stat.MsgSize)
-			log.Printf("[%d][%s] Received: %d, Speed: %.2f MB/s",
-				atomic.LoadInt64(&count), subj, subNum,
-				float64(subNum - lastSubNum) * float64(size) / 1024 / 1024)
-			lastSubNum = subNum
+			Received, size := atomic.LoadInt64(&stat.Received), atomic.LoadInt64(&stat.MsgSize)
+			log.Printf("[%d] [%s] Received msgs: %d, Speed: %.2f MB/s",
+				atomic.LoadInt64(&goroutineNum), subj, Received,
+				float64(Received - lastReceived) * float64(size) / 1024 / 1024)
+			lastReceived = Received
 		}
 	}()
 
@@ -87,12 +91,12 @@ func main() {
 		defer nc.Close()
 
 		go runSubscriber(nc, &finishwg, i, *numSubjects, *startSub, &stat)
-		atomic.AddInt64(&count, 1)
+		atomic.AddInt64(&goroutineNum, 1)
 	}
 	finishwg.Wait()
 	log.Printf("%d goroutine finished, subject: %s (Press enter to end)", *numSubs, subj)
 	os.Stdin.Read(make([]byte, 1))
-	log.Printf("Tatol received: %d", atomic.LoadInt64(&stat.Received))
+	log.Printf("Total received msgs: %d", atomic.LoadInt64(&stat.Received))
 }
 
 type ReceivedStat struct {
@@ -114,7 +118,7 @@ func runSubscriber(nc *nats.Conn, finishwg *sync.WaitGroup,
 			log.Printf("Subscribe %s failed, errmsg: %v\n", subj, err)
 		}
 		sub.SetPendingLimits(-1, -1)
-		nc.Flush()
+		// nc.Flush()
 	}
 	finishwg.Done()
 }
@@ -134,5 +138,22 @@ func setupConnOptions(opts []nats.Option) []nats.Option {
 	opts = append(opts, nats.ClosedHandler(func(nc *nats.Conn) {
 		log.Fatalf("Exiting: %v", nc.LastError())
 	}))
+
+	opts = append(opts, nats.ErrorHandler(natsErrHandler))
 	return opts
+}
+
+func natsErrHandler(nc *nats.Conn, sub *nats.Subscription, natsErr error) {
+	fmt.Printf("error: %v\n", natsErr)
+	if natsErr == nats.ErrSlowConsumer {
+		pendingMsgs, _, err := sub.Pending()
+		if err != nil {
+			fmt.Printf("couldn't get pending messages: %v", err)
+			return
+		}
+		fmt.Printf("Falling behind with %d pending messages on subject %q.\n",
+			pendingMsgs, sub.Subject)
+		// Log error, notify operations...
+	}
+	// check for other errors
 }
