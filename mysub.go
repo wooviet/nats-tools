@@ -43,7 +43,7 @@ func main() {
 	var startSub = flag.Int("ss", DefaultStartSubjNum, "Start subject number")
 	var showHelp = flag.Bool("h", false, "Show help message")
 
-	log.SetFlags(0)
+	// log.SetFlags(0)
 	flag.Usage = usage
 	flag.Parse()
 
@@ -54,10 +54,6 @@ func main() {
 	if *showTime {
 		log.SetFlags(log.LstdFlags)
 	}
-
-	// Connect Options.
-	opts := []nats.Option{nats.Name("NATS Sample Subscriber")}
-	opts = setupConnOptions(opts)
 
 	// First topic name
 	subj := fmt.Sprintf("subject%d", *startSub)
@@ -84,9 +80,14 @@ func main() {
 	var finishwg sync.WaitGroup
 	finishwg.Add(*numSubs)
 	for i := 0; i < *numSubs; i++ {
+		// Connect Options.
+		name := fmt.Sprintf("SUB:%d", i)
+		opts := []nats.Option{nats.Name(name)}
+		opts = setupConnOptions(opts)
 		nc, err := nats.Connect(*urls, opts...)
 		if err != nil {
-			log.Fatalf("Can't connect: %v, already connected: %d\n", err, i)
+			log.Printf("Can't connect: %v, already connected: %d\n", err, i)
+			continue
 		}
 		defer nc.Close()
 
@@ -107,8 +108,17 @@ type ReceivedStat struct {
 func runSubscriber(nc *nats.Conn, finishwg *sync.WaitGroup,
 	num, numSubjects, startSub int, stat *ReceivedStat) {
 	for i := 0; i < numSubjects; i++ {
+		n := i
 		subj := "subject" + strconv.Itoa(num * numSubjects + i + startSub)
-		sub, err := nc.Subscribe(subj, func(msg *nats.Msg) {
+		var sub *nats.Subscription
+		var err error
+		sub, err = nc.Subscribe(subj, func(msg *nats.Msg) {
+			// if stat.Received % 1000 == 0 {
+			pMsgs, pBytes, _ := sub.Pending()
+			if pMsgs > 100 {
+				log.Printf("[#%d] Pending (%s): Msgs:%v, Bytes:%v\n", n, subj, pMsgs, pBytes)
+			}
+
 			atomic.AddInt64(&stat.Received, 1)
 			atomic.StoreInt64(&stat.MsgSize, int64(len(msg.Data)))
 			msg.Respond([]byte(""))
@@ -121,6 +131,7 @@ func runSubscriber(nc *nats.Conn, finishwg *sync.WaitGroup,
 		// nc.Flush()
 	}
 	finishwg.Done()
+	
 }
 
 func setupConnOptions(opts []nats.Option) []nats.Option {

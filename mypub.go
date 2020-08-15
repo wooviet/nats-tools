@@ -3,13 +3,15 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/nats-io/nats.go"
 	"log"
 	"os"
+	// "runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 func usage() {
@@ -32,6 +34,7 @@ const (
 	DefaultMsgInterval  = 0
 	DefaultSplitNum     = 100000
 	DefaultSplitGoNum   = 10
+	DefaultMaxInflight  = 100
 )
 
 func main() {
@@ -47,7 +50,7 @@ func main() {
 	var interval = flag.Int("t", DefaultMsgInterval, "Send message interval (ms)")
 	var showHelp = flag.Bool("h", false, "Show help message")
 
-	log.SetFlags(0)
+	// log.SetFlags(0)
 	flag.Usage = usage
 	flag.Parse()
 
@@ -74,7 +77,6 @@ func main() {
 
 	// Connect Options.
 	// opts := []nats.Option{nats.Name("NATS Sample Publisher"), nats.UseOldRequestStyle()}
-	opts := []nats.Option{nats.Name("NATS Sample Publisher")}
 
 	// First topic name
 	subj := fmt.Sprintf("subject%d", *startSub)
@@ -89,18 +91,28 @@ func main() {
 	goroutineNum := int64(0)
 	stat := PublishStat{}
 	totalMsgNum := *numMsgs * totalSubjNum
+
 	// goroutine for printing statistics
 	go func() {
 		lastPubNum, lastTimeoutMsgs := int64(0), int64(0)
 		for range time.Tick(time.Second) {
 			pubNum := atomic.LoadInt64(&stat.PubNum)
+			inflight := atomic.LoadInt64(&stat.InflightRequests)
+
+			// Total Failed Requests
 			timeoutMsgs := atomic.LoadInt64(&stat.TimeoutNum)
-			log.Printf("goroutineNum: %d, Closed: %d, Total: %d, Published msgs: %d, " +
-				"Speed: %d msgs/s %.2f MB/s, Timeout Msgs: Total: %d, %d msgs/s",
-				atomic.LoadInt64(&goroutineNum), atomic.LoadInt64(&stat.CloseNum),
-				totalMsgNum, pubNum, pubNum-lastPubNum,
+			log.Printf("goroutineNum: %d, Closed: %d, Total: %d, Published msgs: %d, "+
+				"Speed: %d msgs/s %.2f MB/s, Timeout Msgs: Total: %d, %d msgs/s. Inflight: %v",
+				atomic.LoadInt64(&goroutineNum),
+				atomic.LoadInt64(&stat.CloseNum),
+				totalMsgNum,
+				pubNum,
+				pubNum-lastPubNum,
 				float64(pubNum-lastPubNum)*float64(*msgSize)/1024/1024,
-				timeoutMsgs, timeoutMsgs-lastTimeoutMsgs)
+				timeoutMsgs,
+				timeoutMsgs-lastTimeoutMsgs,
+				inflight,
+			)
 			lastPubNum = pubNum
 			lastTimeoutMsgs = timeoutMsgs
 		}
@@ -110,38 +122,50 @@ func main() {
 	finishNum := totalSubjNum
 	if totalSubjNum > DefaultSplitNum {
 		finishNum = totalSubjNum / *splitNum
-		if totalSubjNum % *splitNum != 0 {
+		if totalSubjNum%*splitNum != 0 {
 			finishNum++
 		}
 	}
 	sp := StopProcess{}
 	sp.newSp(finishNum)
 	start := time.Now()
+	fmt.Println(*numPubs, "clients using", *numSubjects, "goroutines")
 	for i, tmpSubjNum := 0, totalSubjNum; i < *numPubs; i++ {
+		n := i
+		name := fmt.Sprintf("PUB:%d", n)
+		opts := []nats.Option{nats.Name(name)}
 		nc, err := nats.Connect(*urls, opts...)
 		if err != nil {
-			log.Fatalf("Can't connect: %v, already connected: %d\n", err, i)
+			log.Printf("Can't connect: %v, already connected: %d\n", err, i)
+			continue
 		}
 		defer nc.Close()
 
-		for j := 0; j < *numSubjects; j++ {
-			// If there are more than DefaultSplitNum topics, each DefaultSplitGoNum topic shares a goroutine
-			if totalSubjNum > DefaultSplitNum {
-				if atomic.LoadInt64(&goroutineNum) % int64(*splitNum) == 0 {
-					numReqs := tmpSubjNum
-					if tmpSubjNum - *splitNum >= 0 {
-						numReqs = *splitNum
-						tmpSubjNum -= *splitNum
+		go func(){
+			// 'Warm up' to setup the async request handler.
+			nc.Request("fake.warmup", []byte(""), 1*time.Millisecond)
+
+			for j := 0; j < *numSubjects; j++ {
+				pubName := fmt.Sprintf("%s:%d", name, j)
+				// If there are more than DefaultSplitNum topics, each DefaultSplitGoNum topic shares a goroutine
+				if totalSubjNum > DefaultSplitNum {
+					if atomic.LoadInt64(&goroutineNum)%int64(*splitNum) == 0 {
+						numReqs := tmpSubjNum
+						if tmpSubjNum-*splitNum >= 0 {
+							numReqs = *splitNum
+							tmpSubjNum -= *splitNum
+						}
+						go runPublisher(pubName, nc, &sp, numReqs, *numMsgs, *msgSize,
+							*interval, i**numSubjects+j+*startSub, &stat)
 					}
-					go runPublisher(nc, &sp, numReqs, *numMsgs, *msgSize,
-						*interval, i * *numSubjects + j + *startSub, &stat)
+				} else {
+					go runPublisher(pubName, nc, &sp, 1, *numMsgs, *msgSize,
+						*interval, i**numSubjects+j+*startSub, &stat)
 				}
-			}else{
-				go runPublisher(nc, &sp, 1, *numMsgs, *msgSize,
-					*interval, i * *numSubjects + j + *startSub, &stat)
+				atomic.AddInt64(&goroutineNum, 1)
+				time.Sleep(1 * time.Millisecond)
 			}
-			atomic.AddInt64(&goroutineNum, 1)
-		}
+		}()
 	}
 	log.Printf("%d goroutine finished (Press enter to end)", finishNum)
 	os.Stdin.Read(make([]byte, 1))
@@ -153,14 +177,15 @@ func main() {
 }
 
 type PublishStat struct {
-	TimeoutNum int64
-	PubNum     int64
-	CloseNum   int64
+	TimeoutNum       int64
+	PubNum           int64
+	CloseNum         int64
+	InflightRequests int64
 }
 
 type StopProcess struct {
 	Done chan struct{}
-	Wg sync.WaitGroup
+	Wg   sync.WaitGroup
 }
 
 func (sp *StopProcess) newSp(wgNum int) *StopProcess {
@@ -169,7 +194,7 @@ func (sp *StopProcess) newSp(wgNum int) *StopProcess {
 	return sp
 }
 
-func runPublisher(nc *nats.Conn, sp *StopProcess,
+func runPublisher(name string, nc *nats.Conn, sp *StopProcess,
 	numReqs, numMsgs, msgSize, interval, num int, stat *PublishStat) {
 	// Message content
 	args := flag.Args()[0]
@@ -180,6 +205,8 @@ func runPublisher(nc *nats.Conn, sp *StopProcess,
 			msg[i] = args[i]
 		}
 	}
+
+	slowDeadline := 1 * time.Second
 	for i := 0; i < numMsgs; i++ {
 		for j := 0; j < numReqs; j++ {
 			select {
@@ -189,15 +216,41 @@ func runPublisher(nc *nats.Conn, sp *StopProcess,
 				return
 			default:
 			}
+
 			subj := "subject" + strconv.Itoa(num+j)
-			_, err := nc.Request(subj, msg, 2*time.Second)
+
+			// inflight := atomic.LoadInt64(&stat.InflightRequests)
+			// if inflight > DefaultMaxInflight {
+			// 	// time.Sleep(2 * time.Second)
+			// 	// runtime.Gosched()
+			// }
+
+			requestStart := time.Now()
+			atomic.AddInt64(&stat.InflightRequests, 1)
+
+			var err error
+			if j == 0 {
+				// First request is slightly slower than the rest because
+				// of initializing the request handler for the client.
+				_, err = nc.Request(subj, msg, 4*time.Second)
+			} else {
+				_, err = nc.Request(subj, msg, 2*time.Second)
+			}
+			atomic.AddInt64(&stat.InflightRequests, -1)
+
+			// Find slow requests that aren't the first request.
+			responseTime := time.Since(requestStart)
+			if responseTime > slowDeadline && j != 0 {
+				log.Printf("SLOW: %v:i:%d:j:%d\t-\t%v\t%v\n", name, i, j, responseTime, subj)
+			}
 			if err != nil {
-				if nc.LastError() != nil {}
+				log.Printf("ERROR: %v:i:%d:j:%d\t-\t%v\t%v\t%v\n", name, i, j, err, subj, responseTime)
 				if err == nats.ErrTimeout {
 					atomic.AddInt64(&stat.TimeoutNum, 1)
 				}
 			}
 			atomic.AddInt64(&stat.PubNum, 1)
+
 			time.Sleep(time.Duration(interval) * time.Millisecond)
 		}
 	}
