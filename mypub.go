@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+
 	// "runtime"
 	"strconv"
 	"sync"
@@ -34,7 +35,7 @@ const (
 	DefaultMsgInterval  = 0
 	DefaultSplitNum     = 100000
 	DefaultSplitGoNum   = 10
-	DefaultMaxInflight  = 100
+	DefaultMaxInflight  = 2000
 )
 
 func main() {
@@ -98,11 +99,14 @@ func main() {
 		for range time.Tick(time.Second) {
 			pubNum := atomic.LoadInt64(&stat.PubNum)
 			inflight := atomic.LoadInt64(&stat.InflightRequests)
+			waiting := atomic.LoadInt64(&stat.Waiting)
+			fast := atomic.LoadInt64(&stat.Fast)
+			slow := atomic.LoadInt64(&stat.Slow)
 
 			// Total Failed Requests
 			timeoutMsgs := atomic.LoadInt64(&stat.TimeoutNum)
 			log.Printf("goroutineNum: %d, Closed: %d, Total: %d, Published msgs: %d, "+
-				"Speed: %d msgs/s %.2f MB/s, Timeout Msgs: Total: %d, %d msgs/s. Inflight: %v",
+				"Speed: %d msgs/s %.2f MB/s, Timeout Msgs: Total: %d, %d msgs/s. Inflight: %v, Waiting: %v, Fast: %v, Slow: %v",
 				atomic.LoadInt64(&goroutineNum),
 				atomic.LoadInt64(&stat.CloseNum),
 				totalMsgNum,
@@ -112,6 +116,9 @@ func main() {
 				timeoutMsgs,
 				timeoutMsgs-lastTimeoutMsgs,
 				inflight,
+				waiting,
+				fast,
+				slow,
 			)
 			lastPubNum = pubNum
 			lastTimeoutMsgs = timeoutMsgs
@@ -141,9 +148,24 @@ func main() {
 		}
 		defer nc.Close()
 
-		go func(){
-			// 'Warm up' to setup the async request handler.
-			nc.Request("fake.warmup", []byte(""), 1*time.Millisecond)
+		go func() {
+			// 'Warm up' to setup the async request handler and give some time
+			// and make extra PING/PONG roundtrip to ensure that the SUB interest
+			// from the request is in the connected server.
+			nc.Request("fake.warmup", []byte("WARMUP"), 1*time.Millisecond)
+
+			// First request is slightly slower than the rest because
+			// of initializing the request handler for the client,
+			// so make a roundtrip to try to ensure servers are ready.
+			err := nc.Flush()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			// Wait as well for client's _INBOX.> interest to travel
+			// to the other cluster, otherwise we will get a few
+			// timeouts when making the first requests.
+			time.Sleep(500 * time.Millisecond)
 
 			for j := 0; j < *numSubjects; j++ {
 				pubName := fmt.Sprintf("%s:%d", name, j)
@@ -163,7 +185,6 @@ func main() {
 						*interval, i**numSubjects+j+*startSub, &stat)
 				}
 				atomic.AddInt64(&goroutineNum, 1)
-				time.Sleep(1 * time.Millisecond)
 			}
 		}()
 	}
@@ -181,6 +202,9 @@ type PublishStat struct {
 	PubNum           int64
 	CloseNum         int64
 	InflightRequests int64
+	Waiting          int64
+	Fast             int64
+	Slow             int64
 }
 
 type StopProcess struct {
@@ -208,6 +232,13 @@ func runPublisher(name string, nc *nats.Conn, sp *StopProcess,
 
 	slowDeadline := 1 * time.Second
 	for i := 0; i < numMsgs; i++ {
+		// Make an initial server to roundtrip to try to ensure both
+		// client and server are ready for the burst of requests.
+		err := nc.Flush()
+		if err != nil {
+			log.Printf("SLOW FLUSH: %v:i:%d\t\n", name, i)
+		}
+
 		for j := 0; j < numReqs; j++ {
 			select {
 			case <-sp.Done:
@@ -219,30 +250,27 @@ func runPublisher(name string, nc *nats.Conn, sp *StopProcess,
 
 			subj := "subject" + strconv.Itoa(num+j)
 
-			// inflight := atomic.LoadInt64(&stat.InflightRequests)
-			// if inflight > DefaultMaxInflight {
-			// 	// time.Sleep(2 * time.Second)
-			// 	// runtime.Gosched()
-			// }
+			inflight := atomic.LoadInt64(&stat.InflightRequests)
+			if inflight > DefaultMaxInflight {
+				atomic.AddInt64(&stat.Waiting, 1)
+				time.Sleep(time.Duration(4*interval) * time.Millisecond)
+				atomic.AddInt64(&stat.Waiting, -1)
+			}
 
 			requestStart := time.Now()
 			atomic.AddInt64(&stat.InflightRequests, 1)
-
-			var err error
-			if j == 0 {
-				// First request is slightly slower than the rest because
-				// of initializing the request handler for the client.
-				_, err = nc.Request(subj, msg, 4*time.Second)
-			} else {
-				_, err = nc.Request(subj, msg, 2*time.Second)
-			}
+			_, err := nc.Request(subj, msg, 2*time.Second)
 			atomic.AddInt64(&stat.InflightRequests, -1)
 
-			// Find slow requests that aren't the first request.
+			// Find slow requests that aren't the first request from a burst.
 			responseTime := time.Since(requestStart)
-			if responseTime > slowDeadline && j != 0 {
-				log.Printf("SLOW: %v:i:%d:j:%d\t-\t%v\t%v\n", name, i, j, responseTime, subj)
+			if responseTime > slowDeadline {
+				atomic.AddInt64(&stat.Slow, 1)
+				// log.Printf("SLOW: %v:i:%d:j:%d\t-\t%v\t%v\n", name, i, j, responseTime, subj)
+			} else {
+				atomic.AddInt64(&stat.Fast, 1)
 			}
+
 			if err != nil {
 				log.Printf("ERROR: %v:i:%d:j:%d\t-\t%v\t%v\t%v\n", name, i, j, err, subj, responseTime)
 				if err == nats.ErrTimeout {
@@ -250,9 +278,13 @@ func runPublisher(name string, nc *nats.Conn, sp *StopProcess,
 				}
 			}
 			atomic.AddInt64(&stat.PubNum, 1)
-
 			time.Sleep(time.Duration(interval) * time.Millisecond)
 		}
+
+		// Add wait between each burst of requests.
+		atomic.AddInt64(&stat.Waiting, 1)
+		time.Sleep(time.Duration(2*interval) * time.Millisecond)
+		atomic.AddInt64(&stat.Waiting, -1)
 	}
 	sp.Wg.Done()
 	atomic.AddInt64(&stat.CloseNum, 1)
